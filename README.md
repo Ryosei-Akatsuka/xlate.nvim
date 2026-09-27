@@ -78,7 +78,7 @@ require("trans").setup({
   cmd = "trans",               -- 翻訳コマンド
   extra_args = { "-b", "-no-ansi" },
   timeout = 10000,             -- 1 行あたりのタイムアウト (ms)
-  max_concurrency = 6,         -- 同時に起動する trans プロセス数
+  max_concurrency = 2,         -- 同時に起動する trans プロセス数（デフォルト: 2）
   cache = {
     enabled = true,
     path = vim.fn.stdpath("cache") .. "/trans-nvim/cache.json",
@@ -93,6 +93,22 @@ require("trans").setup({
 ```lua
 vim.api.nvim_set_hl(0, "TransTranslated", { fg = "#7f849c" })
 ```
+
+### 並列数の目安
+
+`max_concurrency`（同時起動する `trans` プロセス数）は実測しています。16 行 × 各並列数 3 回（キャッシュ無効）:
+
+| 並列数 | 平均所要時間 | スピードアップ | 初回表示遅延 |
+| ---: | ---: | ---: | ---: |
+| 1 | 12,213 ms | 1.00x | 793 ms |
+| **2** | **3,791 ms** | **3.22x** | **292 ms** |
+| 4 | 2,278 ms | 5.36x | 324 ms |
+| 8 | 1,591 ms | 7.67x | 411 ms |
+| 16 | 1,488 ms | 8.21x | 608 ms |
+
+- **デフォルトは 2**。初回表示が最速（約300ms）で、総時間も約 3 倍に短縮できるため
+- 最大スループットが要る場合は `max_concurrency = 8`（8 並列で 7.7x、16 並列は +7% しか伸びません）
+- 逐次表示中は初回の1件が届いた時点から描画が始まるため、体感速度は「初回表示遅延」に現れます
 
 ## 仕組み
 

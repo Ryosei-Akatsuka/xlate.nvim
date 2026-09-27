@@ -239,9 +239,18 @@ trans.setup({
 local tcfg = require("trans.translator").get_config()
 eq(tcfg.target, "ja", "target forwarded to backend")
 deq(tcfg.extra_args, { "-b", "-no-ansi" }, "default extra args")
+eq(tcfg.max_concurrency, 2, "default parallelism is 2")
+eq(trans.config.max_concurrency, 2, "default parallelism visible in config")
+
 trans.setup({ extra_args = { "-b" }, cache = { enabled = false } })
 deq(require("trans.translator").get_config().extra_args, { "-b" }, "extra args are replaced")
+
+trans.setup({ max_concurrency = 5, cache = { enabled = false } })
+eq(require("trans.translator").get_config().max_concurrency, 5, "parallelism is configurable")
+eq(trans.config.max_concurrency, 5, "parallelism kept in config")
+
 trans.setup({ target = "ja", cache = { enabled = true, path = tmp_cache }, notify = true })
+eq(require("trans.translator").get_config().max_concurrency, 2, "parallelism restored to default")
 
 local notifications = {}
 vim.notify = function(msg)

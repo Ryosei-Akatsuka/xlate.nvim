@@ -21,7 +21,9 @@ local config = {
   target = ":ja",
   extra_args = { "-b", "-no-ansi" },
   timeout = 10000,
-  max_concurrency = 6,
+  -- Kept in sync with trans.Config.default (see trans.init): 2 parallel
+  -- processes gave the best first-result latency in our benchmark.
+  max_concurrency = 2,
   use_cache = true,
 }
 

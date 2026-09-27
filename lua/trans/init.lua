@@ -30,7 +30,12 @@ M.defaults = {
   cmd = "trans",
   extra_args = { "-b", "-no-ansi" },
   timeout = 10000,
-  max_concurrency = 6,
+  -- Parallel `trans` processes. Measured on 16 lines (3 runs each):
+  --   1x -> 12.2s, 2x -> 3.8s (3.2x), 4x -> 2.3s (5.4x),
+  --   8x -> 1.6s (7.7x), 16x -> 1.5s (8.2x, no real gain)
+  -- 2 is the default: best first-result latency (~300ms) while already
+  -- cutting the wall time by ~3x.
+  max_concurrency = 2,
   cache = {
     enabled = true,
     path = vim.fn.stdpath("cache") .. "/trans-nvim/cache.json",
