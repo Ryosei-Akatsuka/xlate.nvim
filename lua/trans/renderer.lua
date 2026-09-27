@@ -5,13 +5,24 @@
 ---* saving the buffer does not write them out
 ---* yanks and edits never see them
 ---* clearing only drops extmarks
+---
+---Display is incremental: `begin()` prepares an empty rendering session and
+---`show()` upserts the virtual lines of a single unit every time one more
+---line is ready, so results appear one by one while the backend is still
+---working. Each unit keeps a stable extmark id, so updates happen in place.
+
+local api = vim.api
 
 local M = {}
 
-M.ns = vim.api.nvim_create_namespace("trans.nvim")
+M.ns = api.nvim_create_namespace("trans.nvim")
 
----@type table<integer, integer[]> bufnr -> extmark ids
-local marks = {}
+---@class trans.RenderState
+---@field highlight string
+---@field ids table<integer, integer> unit index -> extmark id
+
+---@type table<integer, trans.RenderState> bufnr -> state
+local states = {}
 
 ---Turn a unit plus its translations into virtual lines.
 ---@param unit trans.Unit
@@ -57,72 +68,119 @@ end
 ---@param bufnr integer
 ---@return boolean true when something was removed
 function M.clear(bufnr)
-  local ids = marks[bufnr]
-  if not ids then
+  local state = states[bufnr]
+  if not state then
     return false
   end
-  marks[bufnr] = nil
-  if not vim.api.nvim_buf_is_valid(bufnr) then
+  states[bufnr] = nil
+  if not api.nvim_buf_is_valid(bufnr) then
     return true
   end
-  for _, id in ipairs(ids) do
-    vim.api.nvim_buf_del_extmark(bufnr, M.ns, id)
+  local removed = 0
+  for _, id in pairs(state.ids) do
+    if api.nvim_buf_del_extmark(bufnr, M.ns, id) then
+      removed = removed + 1
+    end
   end
-  return #ids > 0
+  return removed > 0
+end
+
+---Start a rendering session for a buffer (drops any previous marks).
+---@param bufnr integer
+---@param opts { highlight: string }|nil
+function M.begin(bufnr, opts)
+  M.clear(bufnr)
+  states[bufnr] = {
+    highlight = (opts and opts.highlight) or "TransTranslated",
+    ids = {},
+  }
+end
+
+---Draw (or redraw) one unit with whatever translations are available so far.
+---
+---Passing no translation yet removes the unit's marks again, so a partially
+---filled unit always shows exactly the lines that are ready.
+---@param bufnr integer
+---@param unit_index integer position of the unit in the detection result
+---@param unit trans.Unit
+---@param translations (string|nil)[]
+---@return boolean shown whether the unit is currently visible
+function M.show(bufnr, unit_index, unit, translations)
+  local state = states[bufnr]
+  if not state or not api.nvim_buf_is_valid(bufnr) then
+    return false
+  end
+
+  local virt_lines = M.build_lines(unit, translations)
+  local id = state.ids[unit_index]
+
+  if #virt_lines == 0 then
+    if id then
+      pcall(api.nvim_buf_del_extmark, bufnr, M.ns, id)
+      state.ids[unit_index] = nil
+    end
+    return false
+  end
+
+  local chunks = {} ---@type string[][]
+  for _, text in ipairs(virt_lines) do
+    chunks[#chunks + 1] = { { text, state.highlight } }
+  end
+
+  local row = math.min(unit.end_row, api.nvim_buf_line_count(bufnr) - 1)
+  if row < 0 then
+    return false
+  end
+
+  -- Reusing `id` updates the existing extmark in place instead of
+  -- creating a new one on every partial update.
+  local ok, new_id = pcall(api.nvim_buf_set_extmark, bufnr, M.ns, row, 0, {
+    id = id,
+    virt_lines = chunks,
+    virt_lines_above = false,
+    hl_mode = "combine",
+  })
+  if not ok then
+    return false
+  end
+  state.ids[unit_index] = new_id
+  return true
+end
+
+---How many units are currently visible?
+---@param bufnr integer
+---@return integer
+function M.count(bufnr)
+  local state = states[bufnr]
+  return state and vim.tbl_count(state.ids) or 0
 end
 
 ---Does the buffer currently show translations?
 ---@param bufnr integer
 ---@return boolean
 function M.is_rendered(bufnr)
-  return marks[bufnr] ~= nil
+  return M.count(bufnr) > 0
 end
 
 ---Forget bookkeeping for a buffer that is going away.
 ---@param bufnr integer
 function M.forget(bufnr)
-  marks[bufnr] = nil
+  states[bufnr] = nil
 end
 
----Draw translation results.
+---Draw a complete set of translation results (convenience wrapper around
+---`begin()` + `show()` for one-shot rendering).
 ---@param bufnr integer
 ---@param entries { unit: trans.Unit, translations: (string|nil)[] }[]
 ---@param opts { highlight: string }
 ---@return integer count of rendered blocks
 function M.render(bufnr, entries, opts)
-  M.clear(bufnr)
-  if not vim.api.nvim_buf_is_valid(bufnr) then
-    return 0
-  end
-
-  local line_count = vim.api.nvim_buf_line_count(bufnr)
-  local ids = {} ---@type integer[]
+  M.begin(bufnr, opts)
   local rendered = 0
-
-  for _, entry in ipairs(entries) do
-    local virt_lines = M.build_lines(entry.unit, entry.translations)
-    if #virt_lines > 0 then
-      local row = math.min(entry.unit.end_row, line_count - 1)
-      if row >= 0 then
-        local chunks = {} ---@type string[][]
-        for _, text in ipairs(virt_lines) do
-          chunks[#chunks + 1] = { { text, opts.highlight } }
-        end
-        local ok, id = pcall(vim.api.nvim_buf_set_extmark, bufnr, M.ns, row, 0, {
-          virt_lines = chunks,
-          virt_lines_above = false,
-          hl_mode = "combine",
-        })
-        if ok then
-          ids[#ids + 1] = id
-          rendered = rendered + 1
-        end
-      end
+  for i, entry in ipairs(entries) do
+    if M.show(bufnr, i, entry.unit, entry.translations) then
+      rendered = rendered + 1
     end
-  end
-
-  if #ids > 0 then
-    marks[bufnr] = ids
   end
   return rendered
 end

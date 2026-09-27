@@ -86,16 +86,70 @@ local function run(text, cb)
   end
 end
 
----Translate a list of source lines.
+---@class trans.TranslateHandlers
+---@field on_result? fun(index: integer, text: string|nil, from_cache: boolean)
+---  Called as soon as *one* line is ready (cache hit or backend reply), so
+---  callers can display partial results immediately.
+---@field on_done? fun(results: string[], stats: trans.TranslateStats, cancelled: boolean)
+---  Called exactly once when everything finished or the run was cancelled.
+---@field should_stop? fun(): boolean
+---  Polled before every new backend call and before every `on_result`, so a
+---  cancel stops launching further work.
+
+---@class trans.TranslateStats
+---@field cached integer
+---@field translated integer
+---@field failed integer
+
+---Translate a list of source lines, streaming results as they arrive.
 ---
----Cached lines are resolved synchronously; the rest are translated with at
----most `max_concurrency` parallel processes. `cb` is always invoked exactly
----once, with results in the same order as `lines`. Failed lines are `nil`.
+---This never blocks the caller: work is dispatched asynchronously (at most
+---`max_concurrency` parallel processes) and each completion is reported
+---through `on_result` individually. Cached lines are reported synchronously
+---before the function returns.
 ---@param lines string[]
----@param cb fun(results: string[]|nil, stats: { cached: integer, translated: integer, failed: integer })
-function M.translate_lines(lines, cb)
+---@param handlers trans.TranslateHandlers
+function M.translate_lines(lines, handlers)
+  handlers = handlers or {}
+  local on_result = handlers.on_result
+  local on_done = handlers.on_done
+  local should_stop = handlers.should_stop or function()
+    return false
+  end
+
   local results = {} ---@type string[]
   local stats = { cached = 0, translated = 0, failed = 0 }
+  local stopped = false
+  local finished_jobs = 0
+  local done = false
+
+  local function finish(cancelled)
+    if done then
+      return
+    end
+    done = true
+    if on_done then
+      on_done(results, stats, cancelled)
+    end
+  end
+
+  ---@return boolean
+  local function stop_requested()
+    if stopped then
+      return true
+    end
+    if should_stop() then
+      stopped = true
+      return true
+    end
+    return false
+  end
+
+  local function report(index, text, from_cache)
+    if on_result and not stopped then
+      on_result(index, text, from_cache)
+    end
+  end
 
   ---@type { [1]: integer, [2]: string }[]
   local queue = {}
@@ -105,6 +159,7 @@ function M.translate_lines(lines, cb)
     if hit then
       results[i] = hit
       stats.cached = stats.cached + 1
+      report(i, hit, true)
     else
       queue[#queue + 1] = { i, key }
     end
@@ -112,30 +167,29 @@ function M.translate_lines(lines, cb)
 
   local total = #queue
   if total == 0 then
-    cb(results, stats)
+    finish(false)
+    return
+  end
+  if stop_requested() then
+    finish(true)
     return
   end
 
   local running = 0
   local next_job = 1
-  local finished = 0
-  local done = false
-
-  local function maybe_done()
-    if done or finished < total then
-      return
-    end
-    done = true
-    cb(results, stats)
-  end
 
   local pump ---@type fun()
 
   pump = function()
-    if done then
+    if done or stopped then
       return
     end
     while running < (config.max_concurrency or 1) and next_job <= total do
+      if stop_requested() then
+        finish(true)
+        return
+      end
+
       local job = queue[next_job]
       next_job = next_job + 1
       running = running + 1
@@ -143,7 +197,10 @@ function M.translate_lines(lines, cb)
       local index, key = job[1], job[2]
       run(lines[index], function(result)
         running = running - 1
-        finished = finished + 1
+        if done then
+          return
+        end
+        finished_jobs = finished_jobs + 1
         if result then
           results[index] = result
           stats.translated = stats.translated + 1
@@ -153,11 +210,22 @@ function M.translate_lines(lines, cb)
         else
           stats.failed = stats.failed + 1
         end
+
+        if stop_requested() then
+          finish(true)
+          return
+        end
+        report(index, result, false)
+
         pump()
-        maybe_done()
+        if finished_jobs >= total then
+          finish(false)
+        end
       end)
     end
-    maybe_done()
+    if finished_jobs >= total then
+      finish(false)
+    end
   end
 
   pump()

@@ -264,10 +264,10 @@ local before = vim.api.nvim_buf_get_lines(e2e_buf, 0, -1, false)
 ok(trans.translate(e2e_buf), "translate() starts")
 
 local done = vim.wait(30000, function()
-  local ns = require("trans.renderer").ns
-  return #vim.api.nvim_buf_get_extmarks(e2e_buf, ns, 0, -1, {}) > 0
+  return not trans.is_translating(e2e_buf)
 end, 50)
-ok(done, "translation rendered in time")
+ok(done, "translation finished in time")
+ok(require("trans.renderer").is_rendered(e2e_buf), "translation rendered")
 
 local after = vim.api.nvim_buf_get_lines(e2e_buf, 0, -1, false)
 eq(after, before, "buffer content is untouched")
@@ -348,24 +348,133 @@ vim.api.nvim_set_current_buf(md_e2e)
 vim.cmd("Trans")
 
 local md_done = vim.wait(30000, function()
-  return #vim.api.nvim_buf_get_extmarks(md_e2e, ns, 0, -1, {}) >= 3
+  return not trans.is_translating(md_e2e)
 end, 50)
-ok(md_done, "markdown translation rendered")
+ok(md_done, "markdown translation finished")
+
+local md_marks = vim.api.nvim_buf_get_extmarks(md_e2e, ns, 0, -1, { details = true })
+ok(#md_marks >= 3, "markdown units rendered")
 
 eq(vim.api.nvim_buf_get_lines(md_e2e, 0, -1, false), md_before, "markdown buffer untouched")
 
-local md_marks = vim.api.nvim_buf_get_extmarks(md_e2e, ns, 0, -1, { details = true })
 local texts = {}
 for _, m in ipairs(md_marks) do
   local lines = m[4].virt_lines or {}
   ok(#lines > 0, "markdown block has virtual lines")
   texts[#texts + 1] = lines[1][1][1] or ""
 end
-ok(#texts >= 3, "markdown units rendered")
 ok(not table.concat(texts, "\n"):find("skip me"), "code block never translated")
 
 vim.cmd("TransClear")
 eq(#vim.api.nvim_buf_get_extmarks(md_e2e, ns, 0, -1, {}), 0, ":TransClear removes marks")
+
+----------------------------------------------------------------------------
+-- streaming: non-blocking + progressive display
+----------------------------------------------------------------------------
+local nonce = tostring(math.random(1000000, 9999999))
+local prog_buf = make_buf({
+  "// prog one " .. nonce,
+  "int a;",
+  "// prog two " .. nonce,
+  "int b;",
+  "// prog three " .. nonce,
+  "int c;",
+  "// prog four " .. nonce,
+}, "c")
+
+-- Serialise the backend so that arrival order / partial state is observable.
+trans.setup({
+  target = "ja",
+  max_concurrency = 1,
+  cache = { enabled = true, path = tmp_cache },
+  notify = true,
+})
+
+-- A timer that fires while results are still arriving: it can only fire if
+-- the event loop is not blocked by the backend call.
+local timer_fired_while_busy = false
+vim.defer_fn(function()
+  timer_fired_while_busy = require("trans.renderer").count(prog_buf) < 4
+end, 60)
+
+local started_at = vim.uv.hrtime()
+ok(trans.translate(prog_buf), "streaming translate starts")
+local return_ms = (vim.uv.hrtime() - started_at) / 1e6
+ok(return_ms < 200, ("translate() returns without blocking (%.1fms)"):format(return_ms))
+
+local first_shown = vim.wait(30000, function()
+  return require("trans.renderer").count(prog_buf) > 0
+end, 10)
+ok(first_shown, "first result is displayed while the rest is still running")
+
+local partial = require("trans.renderer").count(prog_buf)
+ok(partial < 4, ("progressive display: %d/4 blocks shown first"):format(partial))
+ok(timer_fired_while_busy, "event loop keeps running during translation")
+
+local all_shown = vim.wait(60000, function()
+  return require("trans.renderer").count(prog_buf) == 4
+end, 10)
+ok(all_shown, "all blocks are shown eventually")
+ok(not trans.is_translating(prog_buf), "streaming run finished")
+
+local prog_lines = vim.api.nvim_buf_get_lines(prog_buf, 0, -1, false)
+local prog_marks = vim.api.nvim_buf_get_extmarks(prog_buf, ns, 0, -1, { details = true })
+eq(#prog_marks, 4, "one extmark per unit")
+for _, m in ipairs(prog_marks) do
+  ok(#(m[4].virt_lines or {}) > 0, "every unit ended up with translations")
+end
+eq(vim.api.nvim_buf_get_lines(prog_buf, 0, -1, false), prog_lines, "streaming does not touch the buffer")
+
+----------------------------------------------------------------------------
+-- cancelling while a run is still in flight
+----------------------------------------------------------------------------
+local cancel_nonce = tostring(math.random(1000000, 9999999))
+local cancel_buf = make_buf({
+  "// cancel one " .. cancel_nonce,
+  "int x;",
+  "// cancel two " .. cancel_nonce,
+}, "c")
+
+ok(trans.translate(cancel_buf), "cancel run starts")
+local partial_cancel = vim.wait(10000, function()
+  return require("trans.renderer").count(cancel_buf) > 0
+end, 10)
+ok(partial_cancel, "something is shown before cancelling")
+
+trans.clear(cancel_buf)
+vim.wait(10000, function()
+  return not trans.is_translating(cancel_buf)
+end, 10)
+
+eq(require("trans.renderer").count(cancel_buf), 0, "cancelled run leaves no marks behind")
+ok(not trans.is_translating(cancel_buf), "cancelled run stopped")
+
+----------------------------------------------------------------------------
+-- a plain :write during translation must not discard the results
+-- (:write bumps the changedtick without moving any row)
+----------------------------------------------------------------------------
+local write_nonce = tostring(math.random(1000000, 9999999))
+local write_buf = vim.api.nvim_create_buf(true, false)
+vim.api.nvim_buf_set_name(write_buf, vim.fn.tempname() .. ".c")
+vim.api.nvim_buf_set_lines(write_buf, 0, -1, false, {
+  "// write one " .. write_nonce,
+  "int y;",
+  "// write two " .. write_nonce,
+})
+vim.bo[write_buf].filetype = "c"
+
+ok(trans.translate(write_buf), "write run starts")
+vim.wait(10000, function()
+  return require("trans.renderer").count(write_buf) > 0
+end, 10)
+vim.api.nvim_buf_call(write_buf, function()
+  vim.cmd("silent write!")
+end)
+local write_done = vim.wait(30000, function()
+  return not trans.is_translating(write_buf)
+end, 10)
+ok(write_done, "run keeps going through a plain :write")
+eq(require("trans.renderer").count(write_buf), 2, "results survive a plain :write")
 
 ----------------------------------------------------------------------------
 print(("%d checks, %d failures"):format(checks, failures))

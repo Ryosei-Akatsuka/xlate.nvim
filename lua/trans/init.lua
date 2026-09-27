@@ -100,7 +100,17 @@ local function notify(msg, level)
   vim.notify("trans-nvim: " .. msg, level or vim.log.levels.INFO)
 end
 
+---@type table<integer, true> bufnr -> a translation run is active
+local inflight = {}
+
+---@type table<integer, true> bufnr -> user asked to stop the active run
+local cancel_requested = {}
+
 ---Translate the buffer and show the results as virtual lines.
+---
+---Non-blocking: the backend is called asynchronously and every line is drawn
+---as soon as it is ready, so the editor stays usable and the translation
+---"streams in" progressively.
 ---@param bufnr integer|nil default: current buffer
 ---@return boolean ok
 function M.translate(bufnr)
@@ -110,8 +120,15 @@ function M.translate(bufnr)
     notify("invalid buffer", vim.log.levels.ERROR)
     return false
   end
+  if inflight[bufnr] then
+    notify("translation already in progress")
+    return false
+  end
 
   local changedtick = api.nvim_buf_get_changedtick(bufnr)
+  -- Snapshot of the buffer text: `changedtick` also moves on a plain `:write`,
+  -- so only a real text change may invalidate the detected rows.
+  local snapshot = api.nvim_buf_get_lines(bufnr, 0, -1, false)
 
   local units, err = require("trans.parser").detect(bufnr)
   if not units then
@@ -126,67 +143,134 @@ function M.translate(bufnr)
   end
 
   -- Flatten the units into a single list of source lines, remembering where
-  -- each unit starts so results can be mapped back later.
+  -- each unit starts so results can be mapped back as they arrive.
   local texts = {} ---@type string[]
   local spans = {} ---@type { [1]: integer, [2]: integer }[]
+  local index_to_unit = {} ---@type table<integer, integer>
+  local unit_trans = {} ---@type table<integer, (string|nil)[]>
   for i, unit in ipairs(units) do
     local start = #texts + 1
     for _, line in ipairs(unit.lines) do
       texts[#texts + 1] = line.text
+      index_to_unit[#texts] = i
     end
     spans[i] = { start, #unit.lines }
+    unit_trans[i] = {}
   end
 
-  require("trans.translator").translate_lines(texts, function(results, stats)
-    if not api.nvim_buf_is_valid(bufnr) then
-      return
-    end
-    if api.nvim_buf_get_changedtick(bufnr) ~= changedtick then
-      -- The buffer changed while we were waiting for the backend; the
-      -- detected units no longer line up, so drop the results instead of
-      -- drawing them at the wrong place.
-      notify("buffer changed during translation, results dropped", vim.log.levels.WARN)
-      return
-    end
+  local renderer = require("trans.renderer")
 
-    local entries = {} ---@type { unit: trans.Unit, translations: (string|nil)[] }[]
-    for i, unit in ipairs(units) do
-      local span = spans[i]
-      local translations = {} ---@type (string|nil)[]
-      for j = span[1], span[1] + span[2] - 1 do
-        translations[j - span[1] + 1] = results[j]
+  ---Has the buffer changedtick moved (rows might be stale)?
+  local function tick_changed()
+    return not api.nvim_buf_is_valid(bufnr)
+      or api.nvim_buf_get_changedtick(bufnr) ~= changedtick
+  end
+
+  ---Did the *text* really change? A plain `:write` bumps the changedtick but
+  ---keeps every row in place, so such a run must not be discarded.
+  local function text_changed()
+    return not api.nvim_buf_is_valid(bufnr)
+      or not vim.deep_equal(api.nvim_buf_get_lines(bufnr, 0, -1, false), snapshot)
+  end
+
+  local function cancelled()
+    return cancel_requested[bufnr] == true
+  end
+
+  cancel_requested[bufnr] = nil
+  inflight[bufnr] = true
+  renderer.begin(bufnr, { highlight = M.config.highlight })
+
+  require("trans.translator").translate_lines(texts, {
+    -- Only an explicit cancel (or a gone buffer) stops launching backend
+    -- calls; everything else is reconciled when the run finishes.
+    should_stop = function()
+      return cancelled() or not api.nvim_buf_is_valid(bufnr)
+    end,
+
+    -- Called per line: draw this unit again with everything ready so far.
+    on_result = function(index, text)
+      if not text or cancelled() then
+        return
       end
-      entries[#entries + 1] = { unit = unit, translations = translations }
-    end
+      local unit_index = index_to_unit[index]
+      local span = spans[unit_index]
+      -- Always keep the result, even when it cannot be drawn right now.
+      unit_trans[unit_index][index - span[1] + 1] = text
+      if tick_changed() then
+        -- Rows may be stale right now; the final pass below re-renders once
+        -- we know the text is still intact.
+        return
+      end
+      renderer.show(bufnr, unit_index, units[unit_index], unit_trans[unit_index])
+    end,
 
-    local renderer = require("trans.renderer")
-    local rendered = renderer.render(bufnr, entries, { highlight = M.config.highlight })
-    require("trans.cache").save()
+    -- Called exactly once, when everything is ready or the run was stopped.
+    on_done = function(_, stats)
+      inflight[bufnr] = nil
+      local was_cancelled = cancelled()
+      cancel_requested[bufnr] = nil
 
-    if M.config.notify then
-      notify(("%d block(s) shown | %d translated, %d cached, %d failed"):format(
-        rendered,
-        stats.translated,
-        stats.cached,
-        stats.failed
-      ))
-    end
-    if stats.failed > 0 then
-      notify(
-        ("%d line(s) could not be translated via %q"):format(stats.failed, M.config.cmd),
-        vim.log.levels.WARN
-      )
-    end
-  end)
+      if not api.nvim_buf_is_valid(bufnr) then
+        renderer.forget(bufnr)
+        return
+      end
+      if was_cancelled then
+        renderer.clear(bufnr)
+        return
+      end
+      if text_changed() then
+        renderer.clear(bufnr)
+        notify("buffer changed during translation, results dropped", vim.log.levels.WARN)
+        return
+      end
+
+      -- Final pass: make sure every unit reflects the complete result set
+      -- (units whose lines all failed simply stay hidden).
+      for i, unit in ipairs(units) do
+        renderer.show(bufnr, i, unit, unit_trans[i])
+      end
+      require("trans.cache").save()
+
+      if M.config.notify then
+        notify(("%d block(s) shown | %d translated, %d cached, %d failed"):format(
+          renderer.count(bufnr),
+          stats.translated,
+          stats.cached,
+          stats.failed
+        ))
+      end
+      if stats.failed > 0 then
+        notify(
+          ("%d line(s) could not be translated via %q"):format(stats.failed, M.config.cmd),
+          vim.log.levels.WARN
+        )
+      end
+    end,
+  })
 
   return true
 end
 
+---Is a translation run still active for this buffer?
+---@param bufnr integer|nil
+---@return boolean
+function M.is_translating(bufnr)
+  bufnr = bufnr or api.nvim_get_current_buf()
+  return inflight[bufnr] == true
+end
+
 ---Remove translations from a buffer.
+---
+---When a translation run is still active it is cancelled as well, so results
+---cannot reappear after the user cleared them.
 ---@param bufnr integer|nil
 ---@return boolean had_marks
 function M.clear(bufnr)
   bufnr = bufnr or api.nvim_get_current_buf()
+  if inflight[bufnr] then
+    cancel_requested[bufnr] = true
+  end
   return require("trans.renderer").clear(bufnr)
 end
 
