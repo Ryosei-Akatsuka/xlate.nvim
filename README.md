@@ -45,7 +45,7 @@ Neovim 上でコードや Markdown の文章を翻訳し、**元のバッファ�
   - コード: `c` / `cpp` など
   - Markdown: `markdown`
 
-## イストール
+## インストール 
 
 [lazy.nvim](https://github.com/folke/lazy.nvim) の場合:
 
