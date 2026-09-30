@@ -252,6 +252,16 @@ eq(trans.config.max_concurrency, 5, "parallelism kept in config")
 trans.setup({ target = "ja", cache = { enabled = true, path = tmp_cache }, notify = true })
 eq(require("trans.translator").get_config().max_concurrency, 2, "parallelism restored to default")
 
+eq(trans.config.auto.enabled, false, "auto updates disabled by default")
+eq(trans.config.auto.debounce, 800, "default auto debounce")
+deq(trans.config.auto.events, { "TextChanged", "TextChangedI", "InsertLeave" }, "default auto events")
+
+trans.setup({ auto = { events = { "TextChanged" } }, cache = { enabled = false } })
+deq(trans.config.auto.events, { "TextChanged" }, "auto events are replaced, not merged")
+
+trans.setup({ target = "ja", cache = { enabled = true, path = tmp_cache }, notify = true })
+deq(trans.config.auto.events, { "TextChanged", "TextChangedI", "InsertLeave" }, "auto events restored with defaults")
+
 local notifications = {}
 vim.notify = function(msg)
   notifications[#notifications + 1] = tostring(msg)
@@ -484,6 +494,202 @@ local write_done = vim.wait(30000, function()
 end, 10)
 ok(write_done, "run keeps going through a plain :write")
 eq(require("trans.renderer").count(write_buf), 2, "results survive a plain :write")
+
+----------------------------------------------------------------------------
+-- auto-update (debounced re-translation)
+----------------------------------------------------------------------------
+local auto = require("trans.auto")
+
+trans.setup({
+  target = "ja",
+  max_concurrency = 1,
+  cache = { enabled = true, path = tmp_cache },
+  notify = true,
+  auto = { enabled = true, debounce = 60 },
+})
+eq(trans.config.auto.debounce, 60, "auto debounce is configurable")
+
+local function virt_texts(buf)
+  local out = {}
+  local marks = vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })
+  for _, m in ipairs(marks) do
+    for _, chunk in ipairs(m[4].virt_lines or {}) do
+      out[#out + 1] = chunk[1][1]
+    end
+  end
+  return out
+end
+
+-- `TextChanged` is emitted by the normal-mode event loop, which headless test
+-- code never enters; trigger it right after the edit the way Neovim would.
+local function edit(buf, row, end_row, lines)
+  vim.api.nvim_buf_set_lines(buf, row, end_row, false, lines)
+  vim.api.nvim_exec_autocmds("TextChanged", { buffer = buf, modeline = false })
+end
+
+-- Count translate() invocations from here on (the auto module resolves the
+-- function through the module table at call time, so this wrapper sees them).
+local translate_calls = 0
+local real_translate = trans.translate
+trans.translate = function(bufnr, opts)
+  translate_calls = translate_calls + 1
+  return real_translate(bufnr, opts)
+end
+
+local auto_nonce = tostring(math.random(1000000, 9999999))
+
+-- Prime the cache with a sentence we will later edit into another buffer.
+local prime_buf = make_buf({ "// the weather is fine " .. auto_nonce }, "c")
+ok(trans.translate(prime_buf), "prime run starts")
+ok(vim.wait(30000, function()
+  return not trans.is_translating(prime_buf)
+end, 10), "prime run finished")
+local prime_text = virt_texts(prime_buf)[1]
+ok(prime_text ~= nil and prime_text ~= "", "prime translation rendered")
+
+-- The first translation turns automatic updates on for that buffer.
+local auto_buf = make_buf({
+  "// auto one " .. auto_nonce,
+  "int a;",
+  "// auto two " .. auto_nonce,
+}, "c")
+ok(trans.translate(auto_buf), "first run starts")
+ok(vim.wait(30000, function()
+  return not trans.is_translating(auto_buf)
+end, 10), "first run finished")
+ok(auto.is_enabled(auto_buf), "auto updates enabled after translating")
+local first_render = virt_texts(auto_buf)
+eq(#first_render, 2, "two blocks rendered initially")
+
+-- An edit re-translates the buffer after the debounce window.
+edit(auto_buf, 0, 1, { "// the weather is fine " .. auto_nonce })
+ok(vim.wait(10000, function()
+  local t = virt_texts(auto_buf)
+  return #t == 2 and t[1] == prime_text
+end, 10), "edit triggers an automatic re-translation")
+ok(virt_texts(auto_buf)[1] ~= first_render[1], "stale translation replaced")
+eq(
+  vim.api.nvim_buf_get_lines(auto_buf, 0, -1, false)[1],
+  "// the weather is fine " .. auto_nonce,
+  "auto update leaves the buffer untouched"
+)
+ok(not trans.is_translating(auto_buf), "auto re-translation finished")
+ok(not auto.is_pending(auto_buf), "no update left pending")
+
+-- A burst of edits collapses into a single re-translation.
+local before_burst = translate_calls
+for i = 1, 5 do
+  edit(auto_buf, 0, 1, { "// burst " .. i .. " " .. auto_nonce })
+  vim.wait(10)
+end
+vim.wait(500)
+eq(translate_calls, before_burst + 1, "rapid edits coalesce into one run")
+vim.wait(30000, function()
+  return not trans.is_translating(auto_buf)
+end, 10)
+
+-- :TransClear stops automatic updates for that buffer.
+ok(trans.clear(auto_buf), "clear reports marks removed")
+eq(auto.is_enabled(auto_buf), false, ":TransClear disables auto updates")
+local before_clear = translate_calls
+edit(auto_buf, 0, 1, { "// cleared " .. auto_nonce })
+vim.wait(500)
+eq(translate_calls, before_clear, "no re-translation after :TransClear")
+eq(renderer.count(auto_buf), 0, "marks stay away after clearing")
+
+-- An edit while a run is still going: results are rescheduled, not dropped.
+notifications = {}
+local mid_nonce = tostring(math.random(1000000, 9999999))
+local mid_buf = make_buf({
+  "// mid one " .. mid_nonce,
+  "int m;",
+  "// mid two " .. mid_nonce,
+  "int n;",
+  "// mid three " .. mid_nonce,
+}, "c")
+ok(trans.translate(mid_buf), "run with pending units starts")
+ok(vim.wait(10000, function()
+  return renderer.count(mid_buf) > 0
+end, 5), "first block shown before the edit")
+edit(mid_buf, 0, 1, { "// the weather is fine " .. auto_nonce })
+ok(vim.wait(30000, function()
+  return not trans.is_translating(mid_buf)
+end, 10), "run finished after the edit")
+ok(vim.wait(10000, function()
+  local t = virt_texts(mid_buf)
+  return #t == 3 and t[1] == prime_text
+end, 10), "automatic re-translation after an edit during the run")
+eq(renderer.count(mid_buf), 3, "all blocks rendered after the retry")
+local dropped = false
+for _, msg in ipairs(notifications) do
+  if tostring(msg):find("results dropped", 1, true) then
+    dropped = true
+  end
+end
+ok(not dropped, "edit during a run reschedules instead of dropping results")
+
+-- Automatic runs are silent: no completion summary.
+notifications = {}
+local before_silent = translate_calls
+edit(mid_buf, 0, 1, { "// auto one " .. mid_nonce })
+ok(vim.wait(10000, function()
+  return translate_calls > before_silent
+end, 10), "silent run started")
+ok(vim.wait(10000, function()
+  return not trans.is_translating(mid_buf)
+end, 10), "silent run finished")
+local summary = false
+for _, msg in ipairs(notifications) do
+  if tostring(msg):find("block(s) shown", 1, true) then
+    summary = true
+  end
+end
+ok(not summary, "automatic runs do not notify a completion summary")
+
+-- Undoing back to the displayed text inside the debounce window skips the run.
+local current = vim.api.nvim_buf_get_lines(mid_buf, 0, -1, false)
+local before_undo = translate_calls
+edit(mid_buf, 0, 1, { "// undo probe " .. mid_nonce })
+vim.wait(20)
+edit(mid_buf, 0, 1, { current[1] })
+vim.wait(400)
+eq(translate_calls, before_undo, "restoring the translated text skips the run")
+
+-- Wiping a buffer with a pending update releases its timer.
+local wipe_buf = make_buf({ "// wipe me " .. mid_nonce }, "c")
+ok(trans.translate(wipe_buf), "wipe buffer run starts")
+ok(vim.wait(30000, function()
+  return not trans.is_translating(wipe_buf)
+end, 10), "wipe buffer run finished")
+ok(auto.is_enabled(wipe_buf), "auto enabled for the wipe buffer")
+edit(wipe_buf, 0, 1, { "// wipe me now " .. mid_nonce })
+ok(auto.is_pending(wipe_buf), "update pending before the wipe")
+local timers_before = auto.timer_count()
+vim.api.nvim_buf_delete(wipe_buf, { force = true })
+eq(auto.is_pending(wipe_buf), false, "pending update dropped with the buffer")
+eq(auto.is_enabled(wipe_buf), false, "auto state dropped with the buffer")
+eq(auto.timer_count(), timers_before - 1, "debounce timer closed on wipeout")
+vim.wait(200)
+eq(auto.timer_count(), timers_before - 1, "timer stays closed past the debounce window")
+
+-- Re-running setup must not multiply the update autocmds.
+local before_double = translate_calls
+local double_opts = {
+  target = "ja",
+  max_concurrency = 1,
+  cache = { enabled = true, path = tmp_cache },
+  notify = true,
+  auto = { enabled = true, debounce = 60 },
+}
+trans.setup(double_opts)
+trans.setup(double_opts)
+edit(mid_buf, 0, 1, { "// double setup " .. mid_nonce })
+vim.wait(500)
+eq(translate_calls, before_double + 1, "double setup still yields a single run")
+ok(vim.wait(30000, function()
+  return not trans.is_translating(mid_buf)
+end, 10), "final run finished")
+trans.translate = real_translate
 
 ----------------------------------------------------------------------------
 print(("%d checks, %d failures"):format(checks, failures))

@@ -20,10 +20,16 @@ local M = {}
 ---@field cache trans.CacheConfig
 ---@field highlight string highlight group for translated lines
 ---@field notify boolean show a summary notification after translation
+---@field auto trans.AutoConfig automatic re-translation after edits
 
 ---@class trans.CacheConfig
 ---@field enabled boolean
 ---@field path string|nil where the cache is persisted
+
+---@class trans.AutoConfig
+---@field enabled boolean re-translate the buffer while translations are shown
+---@field events string[] autocmd events that schedule an update
+---@field debounce integer ms to wait after the last edit
 
 M.defaults = {
   target = "ja",
@@ -42,6 +48,14 @@ M.defaults = {
   },
   highlight = "TransTranslated",
   notify = true,
+  -- Keep displayed translations up to date: edits schedule a debounced
+  -- re-translation (silent, cache-first). Opted in because every update
+  -- may start backend calls; `:TransClear` stops it per buffer.
+  auto = {
+    enabled = false,
+    events = { "TextChanged", "TextChangedI", "InsertLeave" },
+    debounce = 800,
+  },
 }
 
 ---@type trans.Config
@@ -56,6 +70,10 @@ function M.setup(opts)
   if opts.extra_args then
     -- Lists must be replaced, not merged index by index.
     M.config.extra_args = opts.extra_args
+  end
+  if opts.auto and opts.auto.events then
+    -- Same list handling as extra_args.
+    M.config.auto.events = opts.auto.events
   end
 
   local cache = require("trans.cache")
@@ -87,8 +105,25 @@ function M.setup(opts)
     group = group,
     callback = function(args)
       require("trans.renderer").forget(args.buf)
+      require("trans.auto").forget(args.buf)
     end,
   })
+  api.nvim_create_autocmd("BufDelete", {
+    group = group,
+    callback = function(args)
+      require("trans.auto").forget(args.buf)
+    end,
+  })
+
+  if M.config.auto.enabled and #M.config.auto.events > 0 then
+    api.nvim_create_autocmd(M.config.auto.events, {
+      group = group,
+      desc = "trans-nvim: schedule a debounced re-translation",
+      callback = function(args)
+        require("trans.auto").schedule(args.buf)
+      end,
+    })
+  end
 
   setup_done = true
 end
@@ -117,16 +152,22 @@ local cancel_requested = {}
 ---as soon as it is ready, so the editor stays usable and the translation
 ---"streams in" progressively.
 ---@param bufnr integer|nil default: current buffer
+---@param opts { silent?: boolean }|nil silent runs skip completion
+---  notifications (used by automatic updates)
 ---@return boolean ok
-function M.translate(bufnr)
+function M.translate(bufnr, opts)
   ensure_setup()
+  opts = opts or {}
+  local silent = opts.silent == true
   bufnr = bufnr or api.nvim_get_current_buf()
   if not api.nvim_buf_is_valid(bufnr) then
     notify("invalid buffer", vim.log.levels.ERROR)
     return false
   end
   if inflight[bufnr] then
-    notify("translation already in progress")
+    if not silent then
+      notify("translation already in progress")
+    end
     return false
   end
 
@@ -140,10 +181,18 @@ function M.translate(bufnr)
     notify(err or "detection failed", vim.log.levels.WARN)
     return false
   end
+
+  -- The buffer now "wants" translations. While `auto.enabled` is set this
+  -- keeps them fresh after every edit until the user runs :TransClear.
+  require("trans.auto").set_enabled(bufnr, true)
+
   if #units == 0 then
-    if M.config.notify then
+    if M.config.notify and not silent then
       notify("nothing to translate")
     end
+    -- Any earlier translations now sit on rows whose comments are gone.
+    require("trans.renderer").clear(bufnr)
+    require("trans.auto").mark_updated(bufnr, snapshot)
     return true
   end
 
@@ -215,9 +264,11 @@ function M.translate(bufnr)
       inflight[bufnr] = nil
       local was_cancelled = cancelled()
       cancel_requested[bufnr] = nil
+      local auto = require("trans.auto")
 
       if not api.nvim_buf_is_valid(bufnr) then
         renderer.forget(bufnr)
+        auto.forget(bufnr)
         return
       end
       if was_cancelled then
@@ -225,8 +276,15 @@ function M.translate(bufnr)
         return
       end
       if text_changed() then
-        renderer.clear(bufnr)
-        notify("buffer changed during translation, results dropped", vim.log.levels.WARN)
+        if auto.schedule(bufnr) then
+          -- The buffer was edited while translating: keep the partial marks
+          -- and schedule a silent re-translation instead of dropping them.
+        else
+          renderer.clear(bufnr)
+          if not silent then
+            notify("buffer changed during translation, results dropped", vim.log.levels.WARN)
+          end
+        end
         return
       end
 
@@ -236,8 +294,9 @@ function M.translate(bufnr)
         renderer.show(bufnr, i, unit, unit_trans[i])
       end
       require("trans.cache").save()
+      auto.mark_updated(bufnr, snapshot)
 
-      if M.config.notify then
+      if M.config.notify and not silent then
         notify(("%d block(s) shown | %d translated, %d cached, %d failed"):format(
           renderer.count(bufnr),
           stats.translated,
@@ -276,6 +335,8 @@ function M.clear(bufnr)
   if inflight[bufnr] then
     cancel_requested[bufnr] = true
   end
+  -- Clearing is the user saying "stop": no automatic re-translation either.
+  require("trans.auto").set_enabled(bufnr, false)
   return require("trans.renderer").clear(bufnr)
 end
 
