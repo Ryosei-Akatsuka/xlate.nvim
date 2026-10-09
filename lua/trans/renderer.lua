@@ -10,6 +10,13 @@
 ---`show()` upserts the virtual lines of a single unit every time one more
 ---line is ready, so results appear one by one while the backend is still
 ---working. Each unit keeps a stable extmark id, so updates happen in place.
+---
+---Marks are tracked per *unit key* (`key()`), not per detection index, so one
+---buffer can hold a full run (`:Trans`) next to individually translated
+---blocks (`:TransHere`) and each of them stays hideable on its own.
+---`find_in_range()` answers "is this block translated?" by looking at where
+---the marks actually sit, which keeps working after the buffer was edited
+---because extmarks move along with their text.
 
 local api = vim.api
 
@@ -19,7 +26,7 @@ M.ns = api.nvim_create_namespace("trans.nvim")
 
 ---@class trans.RenderState
 ---@field highlight string
----@field ids table<integer, integer> unit index -> extmark id
+---@field ids table<string, integer> unit key -> extmark id
 
 ---@type table<integer, trans.RenderState> bufnr -> state
 local states = {}
@@ -64,6 +71,22 @@ function M.build_lines(unit, translations)
   return out
 end
 
+---Stable identity of a unit, used to tell its virtual lines apart from the
+---other translations shown in the same buffer.
+---
+---The row is part of the key on purpose: two identical comments at different
+---places are different units, and sharing one extmark between them would
+---move the first translation down to the second one.
+---@param unit trans.Unit
+---@return string
+function M.key(unit)
+  local parts = { unit.kind, unit.start_row, unit.end_row }
+  for _, line in ipairs(unit.lines) do
+    parts[#parts + 1] = line.prefix .. "\1" .. line.text
+  end
+  return vim.fn.sha256(table.concat(parts, "\0"))
+end
+
 ---Remove all translation marks from a buffer.
 ---@param bufnr integer
 ---@return boolean true when something was removed
@@ -96,28 +119,43 @@ function M.begin(bufnr, opts)
   }
 end
 
+---Prepare a buffer for drawing single blocks, keeping what is already shown.
+---
+---Unlike `begin()` this never drops marks, so translated blocks that are not
+---part of the current run stay visible.
+---@param bufnr integer
+---@param opts { highlight: string }|nil
+function M.ensure(bufnr, opts)
+  if not states[bufnr] then
+    states[bufnr] = {
+      highlight = (opts and opts.highlight) or "TransTranslated",
+      ids = {},
+    }
+  end
+end
+
 ---Draw (or redraw) one unit with whatever translations are available so far.
 ---
 ---Passing no translation yet removes the unit's marks again, so a partially
 ---filled unit always shows exactly the lines that are ready.
 ---@param bufnr integer
----@param unit_index integer position of the unit in the detection result
+---@param key string identity of the unit in this buffer (see `key()`)
 ---@param unit trans.Unit
 ---@param translations (string|nil)[]
 ---@return boolean shown whether the unit is currently visible
-function M.show(bufnr, unit_index, unit, translations)
+function M.show(bufnr, key, unit, translations)
   local state = states[bufnr]
   if not state or not api.nvim_buf_is_valid(bufnr) then
     return false
   end
 
   local virt_lines = M.build_lines(unit, translations)
-  local id = state.ids[unit_index]
+  local id = state.ids[key]
 
   if #virt_lines == 0 then
     if id then
       pcall(api.nvim_buf_del_extmark, bufnr, M.ns, id)
-      state.ids[unit_index] = nil
+      state.ids[key] = nil
     end
     return false
   end
@@ -132,19 +170,106 @@ function M.show(bufnr, unit_index, unit, translations)
     return false
   end
 
-  -- Reusing `id` updates the existing extmark in place instead of
-  -- creating a new one on every partial update.
+  -- Reusing `id` updates the existing extmark in place instead of creating a
+  -- new one on every partial update. The left gravity is what keeps a mark on
+  -- the line it was placed on: with the default gravity, rewriting that line
+  -- would push the translation one row down and `find_in_range` (used by
+  -- `:TransHere`) would lose track of it.
   local ok, new_id = pcall(api.nvim_buf_set_extmark, bufnr, M.ns, row, 0, {
     id = id,
     virt_lines = chunks,
     virt_lines_above = false,
+    right_gravity = false,
     hl_mode = "combine",
   })
   if not ok then
     return false
   end
-  state.ids[unit_index] = new_id
+  state.ids[key] = new_id
   return true
+end
+
+---Which translated block currently sits inside a row range?
+---
+---The mark positions are read back from Neovim instead of being remembered,
+---so a translated block is still found after the buffer was edited (its
+---extmark moved with the text). Only one unit ever anchors on the same row,
+---so at most one key can be inside a range.
+---@param bufnr integer
+---@param start_row integer
+---@param end_row integer
+---@return string|nil key of the translated block, nil when the range is blank
+function M.find_in_range(bufnr, start_row, end_row)
+  local state = states[bufnr]
+  if not state or not api.nvim_buf_is_valid(bufnr) then
+    return nil
+  end
+  local best ---@type string|nil
+  local best_row = -1
+  for key, id in pairs(state.ids) do
+    local ok, mark = pcall(api.nvim_buf_get_extmark_by_id, bufnr, M.ns, id, {})
+    local row = ok and mark and mark[1]
+    if row and row >= start_row and row <= end_row and row >= best_row then
+      best = key
+      best_row = row
+    end
+  end
+  return best
+end
+
+---Drop the translation of a single block, leaving the other ones alone.
+---@param bufnr integer
+---@param key string
+---@return boolean true when a mark was removed
+function M.hide(bufnr, key)
+  local state = states[bufnr]
+  if not state then
+    return false
+  end
+  local id = state.ids[key]
+  if not id then
+    return false
+  end
+  state.ids[key] = nil
+  if not api.nvim_buf_is_valid(bufnr) then
+    return true
+  end
+  return api.nvim_buf_del_extmark(bufnr, M.ns, id)
+end
+
+---Drop translations whose block is gone, e.g. because the comment it
+---belonged to was deleted.
+---
+---Marks follow their text, so a translation of a removed comment would
+---otherwise keep floating over whatever code now occupies that row.
+---@param bufnr integer
+---@param units trans.Unit[] blocks that are still translatable
+---@return integer removed
+function M.prune(bufnr, units)
+  local state = states[bufnr]
+  if not state or not api.nvim_buf_is_valid(bufnr) then
+    return 0
+  end
+  local removed = 0
+  for key, id in pairs(state.ids) do
+    local ok, mark = pcall(api.nvim_buf_get_extmark_by_id, bufnr, M.ns, id, {})
+    local row = ok and mark and mark[1]
+    local inside = false
+    if row then
+      for _, unit in ipairs(units) do
+        if row >= unit.start_row and row <= unit.end_row then
+          inside = true
+          break
+        end
+      end
+    end
+    if not inside then
+      if M.hide(bufnr, key) then
+        removed = removed + 1
+      end
+    end
+  end
+  return removed
 end
 
 ---How many units are currently visible?
@@ -178,7 +303,7 @@ function M.render(bufnr, entries, opts)
   M.begin(bufnr, opts)
   local rendered = 0
   for i, entry in ipairs(entries) do
-    if M.show(bufnr, i, entry.unit, entry.translations) then
+    if M.show(bufnr, M.key(entry.unit), entry.unit, entry.translations) then
       rendered = rendered + 1
     end
   end

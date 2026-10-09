@@ -6,6 +6,9 @@
 ---
 ---The buffer itself is never modified: results are only drawn as virtual
 ---lines, which cannot be saved, yanked or edited.
+---
+---Two entry points share the same pipeline: `translate()` renders every
+---detected unit, `translate_here()` only the one the cursor sits in.
 
 local api = vim.api
 
@@ -146,6 +149,22 @@ local inflight = {}
 ---@type table<integer, true> bufnr -> user asked to stop the active run
 local cancel_requested = {}
 
+---Which detected unit covers this row?
+---
+---A unit spans everything that belongs together (a comment block, a Markdown
+---paragraph, ...), so the cursor may sit on any of its lines.
+---@param units trans.Unit[]
+---@param row integer 0-indexed buffer row
+---@return trans.Unit|nil unit
+local function unit_at(units, row)
+  for _, unit in ipairs(units) do
+    if row >= unit.start_row and row <= unit.end_row then
+      return unit
+    end
+  end
+  return nil
+end
+
 ---Translate the buffer and show the results as virtual lines.
 ---
 ---Non-blocking: the backend is called asynchronously and every line is drawn
@@ -201,18 +220,19 @@ function M.translate(bufnr, opts)
   local texts = {} ---@type string[]
   local spans = {} ---@type { [1]: integer, [2]: integer }[]
   local index_to_unit = {} ---@type table<integer, integer>
-  local unit_trans = {} ---@type table<integer, (string|nil)[]>
+  local unit_trans = {} ---@type table<integer, (string|nil)[]
+  local renderer = require("trans.renderer")
+  local keys = {} ---@type table<integer, string>
   for i, unit in ipairs(units) do
     local start = #texts + 1
     for _, line in ipairs(unit.lines) do
       texts[#texts + 1] = line.text
       index_to_unit[#texts] = i
     end
+    keys[i] = renderer.key(unit)
     spans[i] = { start, #unit.lines }
     unit_trans[i] = {}
   end
-
-  local renderer = require("trans.renderer")
 
   ---Has the buffer changedtick moved (rows might be stale)?
   local function tick_changed()
@@ -256,7 +276,7 @@ function M.translate(bufnr, opts)
         -- we know the text is still intact.
         return
       end
-      renderer.show(bufnr, unit_index, units[unit_index], unit_trans[unit_index])
+      renderer.show(bufnr, keys[unit_index], units[unit_index], unit_trans[unit_index])
     end,
 
     -- Called exactly once, when everything is ready or the run was stopped.
@@ -291,7 +311,7 @@ function M.translate(bufnr, opts)
       -- Final pass: make sure every unit reflects the complete result set
       -- (units whose lines all failed simply stay hidden).
       for i, unit in ipairs(units) do
-        renderer.show(bufnr, i, unit, unit_trans[i])
+        renderer.show(bufnr, keys[i], unit, unit_trans[i])
       end
       require("trans.cache").save()
       auto.mark_updated(bufnr, snapshot)
@@ -299,6 +319,175 @@ function M.translate(bufnr, opts)
       if M.config.notify and not silent then
         notify(("%d block(s) shown | %d translated, %d cached, %d failed"):format(
           renderer.count(bufnr),
+          stats.translated,
+          stats.cached,
+          stats.failed
+        ))
+      end
+      if stats.failed > 0 then
+        notify(
+          ("%d line(s) could not be translated via %q"):format(stats.failed, M.config.cmd),
+          vim.log.levels.WARN
+        )
+      end
+    end,
+  })
+
+  return true
+end
+
+---Translate only the unit that contains `row` (`:TransHere`).
+---
+---Same rendering as `:Trans` — just for a single block: the virtual lines
+---keep their comment markers, and everything still streams in line by line.
+---Running it again on a translated block hides that block again, so the
+---command toggles one block at a time and leaves the rest untouched.
+---
+---Nothing translatable under the row is not an error, it is a quiet no-op.
+---@param bufnr integer|nil default: current buffer
+---@param row integer|nil 0-indexed row, default: the cursor row of the
+---  window the buffer is shown in
+---@return boolean ok false only when the command could not run at all
+function M.translate_here(bufnr, row)
+  ensure_setup()
+  bufnr = bufnr or api.nvim_get_current_buf()
+  if not api.nvim_buf_is_valid(bufnr) then
+    notify("invalid buffer", vim.log.levels.ERROR)
+    return false
+  end
+  if not row then
+    local winid = vim.fn.bufwinid(bufnr)
+    if winid == -1 then
+      notify("buffer is not displayed", vim.log.levels.WARN)
+      return false
+    end
+    row = api.nvim_win_get_cursor(winid)[1] - 1
+  end
+  return M.translate_at(bufnr, row)
+end
+
+---Translate one detected unit that contains `row` (used by `:TransHere`).
+---@param bufnr integer
+---@param row integer 0-indexed buffer row
+---@return boolean ok
+function M.translate_at(bufnr, row)
+  ensure_setup()
+  if not api.nvim_buf_is_valid(bufnr) then
+    notify("invalid buffer", vim.log.levels.ERROR)
+    return false
+  end
+  if inflight[bufnr] then
+    notify("translation already in progress")
+    return false
+  end
+
+  local changedtick = api.nvim_buf_get_changedtick(bufnr)
+  local snapshot = api.nvim_buf_get_lines(bufnr, 0, -1, false)
+
+  local units, err = require("trans.parser").detect(bufnr)
+  if not units then
+    notify(err or "detection failed", vim.log.levels.WARN)
+    return false
+  end
+
+  local unit = unit_at(units, row)
+  if not unit then
+    -- The cursor is on code, not on anything we translate: stay quiet.
+    return true
+  end
+
+  local renderer = require("trans.renderer")
+  -- The user may have run `:Trans` before: translations of comments that are
+  -- gone by now are dropped, so a quick run never leaves one behind.
+  renderer.prune(bufnr, units)
+
+  local key = renderer.key(unit)
+  local shown = renderer.find_in_range(bufnr, unit.start_row, unit.end_row)
+
+  if shown then
+    -- The block is already translated: this run takes it down again.
+    renderer.hide(bufnr, shown)
+    if shown == key then
+      return true
+    end
+    -- The comment changed since it was translated, so its block is redrawn
+    -- from scratch instead of stacking a second virtual line on the old one.
+  end
+
+  local texts = {} ---@type string[]
+  for _, line in ipairs(unit.lines) do
+    texts[#texts + 1] = line.text
+  end
+
+  ---Has the buffer changedtick moved (rows might be stale)?
+  local function tick_changed()
+    return not api.nvim_buf_is_valid(bufnr)
+      or api.nvim_buf_get_changedtick(bufnr) ~= changedtick
+  end
+
+  ---Did the *text* really change? A plain `:write` bumps the changedtick but
+  ---keeps every row in place, so such a run must not be discarded.
+  local function text_changed()
+    return not api.nvim_buf_is_valid(bufnr)
+      or not vim.deep_equal(api.nvim_buf_get_lines(bufnr, 0, -1, false), snapshot)
+  end
+
+  local function cancelled()
+    return cancel_requested[bufnr] == true
+  end
+
+  local trans = {} ---@type (string|nil)[]
+
+  cancel_requested[bufnr] = nil
+  inflight[bufnr] = true
+  -- Never `begin()`: translations of other blocks have to survive.
+  renderer.ensure(bufnr, { highlight = M.config.highlight })
+
+  require("trans.translator").translate_lines(texts, {
+    should_stop = function()
+      return cancelled() or not api.nvim_buf_is_valid(bufnr)
+    end,
+
+    -- A quick translation covers one block, so line index == unit index.
+    on_result = function(index, text)
+      if not text or cancelled() then
+        return
+      end
+      trans[index] = text
+      if tick_changed() then
+        -- Rows may be stale right now; the final pass below re-renders once
+        -- we know the text is still intact.
+        return
+      end
+      renderer.show(bufnr, key, unit, trans)
+    end,
+
+    on_done = function(_, stats)
+      inflight[bufnr] = nil
+      local was_cancelled = cancelled()
+      cancel_requested[bufnr] = nil
+
+      if not api.nvim_buf_is_valid(bufnr) then
+        renderer.forget(bufnr)
+        return
+      end
+      if was_cancelled then
+        renderer.clear(bufnr)
+        return
+      end
+      if text_changed() then
+        -- Only one block is in play, so unlike `:Trans` there is nothing to
+        -- reschedule: drop this block and say so.
+        renderer.hide(bufnr, key)
+        notify("buffer changed during translation, results dropped", vim.log.levels.WARN)
+        return
+      end
+
+      renderer.show(bufnr, key, unit, trans)
+      require("trans.cache").save()
+
+      if M.config.notify then
+        notify(("block translated | %d translated, %d cached, %d failed"):format(
           stats.translated,
           stats.cached,
           stats.failed

@@ -170,7 +170,98 @@ if pu and #pu == 2 then
   eq(pu[2].lines[1].text, "inline", "python inline comment")
 end
 
-----------------------------------------------------------------------------
+-- renderer bookkeeping: unit keys, ensure/hide, find_in_range
+local key_buf = make_buf({
+  "int main() {",
+  "  // alpha",
+  "  // beta",
+  "  int x;",
+  "  /* gamma */",
+  "  return 0;",
+  "}",
+}, "c")
+local key_units = require("trans.parser").detect(key_buf)
+ok(key_units ~= nil and #key_units == 2, "key fixture detects two units")
+
+if key_units and #key_units == 2 then
+  local u_line, u_block = key_units[1], key_units[2]
+  local k_line, k_block = renderer.key(u_line), renderer.key(u_block)
+
+  eq(renderer.key(u_line), k_line, "unit key is stable")
+  ok(k_line ~= k_block, "different units get different keys")
+
+  -- the same text on another row is another unit, not a shared extmark
+  local twin_buf = make_buf({ "// twin", "int a;", "// twin" }, "c")
+  local twin_units = require("trans.parser").detect(twin_buf)
+  if twin_units and #twin_units == 2 then
+    ok(
+      renderer.key(twin_units[1]) ~= renderer.key(twin_units[2]),
+      "identical texts keep separate keys"
+    )
+    renderer.begin(twin_buf, { highlight = "TransTranslated" })
+    renderer.show(twin_buf, renderer.key(twin_units[1]), twin_units[1], { "ふたご" })
+    renderer.show(twin_buf, renderer.key(twin_units[2]), twin_units[2], { "ふたご" })
+    local twin_rows = {}
+    for _, m in ipairs(vim.api.nvim_buf_get_extmarks(twin_buf, renderer.ns, 0, -1, {})) do
+      twin_rows[#twin_rows + 1] = m[2]
+    end
+    table.sort(twin_rows)
+    deq(twin_rows, { 0, 2 }, "each twin keeps its own extmark")
+  end
+  eq(renderer.clear(twin_buf), true, "clearing the twin buffer")
+
+  -- `ensure` never drops what is already shown, `hide` drops a single block
+  renderer.begin(key_buf, { highlight = "TransTranslated" })
+  eq(renderer.show(key_buf, k_line, u_line, { "アルファ", "ベータ" }), true, "show line unit")
+  eq(renderer.show(key_buf, k_block, u_block, { "ガンマ" }), true, "show block unit")
+  eq(renderer.count(key_buf), 2, "two blocks are visible")
+
+  renderer.ensure(key_buf, { highlight = "TransTranslated" })
+  eq(renderer.count(key_buf), 2, "ensure keeps the visible blocks")
+
+  eq(renderer.hide(key_buf, k_line), true, "hide removes the block")
+  eq(renderer.count(key_buf), 1, "the other block stays visible")
+  eq(renderer.hide(key_buf, k_line), false, "hiding twice reports nothing")
+  eq(renderer.hide(key_buf, "no-such-key"), false, "hiding an unknown key reports nothing")
+
+  -- find_in_range follows the marks when the buffer changes above them
+  local srow, erow = u_block.start_row + 1, u_block.end_row + 1
+  vim.api.nvim_buf_set_lines(key_buf, 0, 0, false, { "int above;" })
+  eq(renderer.find_in_range(key_buf, srow, erow), k_block, "block found after it was shifted")
+  eq(renderer.find_in_range(key_buf, u_block.start_row, u_block.end_row), nil, "the stale range is empty")
+  eq(renderer.find_in_range(key_buf, 0, 0), nil, "a blank range is empty")
+
+  renderer.clear(key_buf)
+  eq(renderer.find_in_range(key_buf, 0, -1), nil, "nothing left to find after clear")
+
+  -- a translation of a comment that no longer exists is dropped again
+  local gone_buf = make_buf({
+    "// keep me",
+    "int a;",
+    "// remove me",
+    "int b;",
+  }, "c")
+  local gone_units = require("trans.parser").detect(gone_buf)
+  if gone_units and #gone_units == 2 then
+    renderer.begin(gone_buf, { highlight = "TransTranslated" })
+    for _, u in ipairs(gone_units) do
+      renderer.show(gone_buf, renderer.key(u), u, { "てん" })
+    end
+    eq(renderer.count(gone_buf), 2, "both blocks are translated")
+    vim.api.nvim_buf_set_lines(gone_buf, 2, 3, false, { "int c;" })
+    local left = require("trans.parser").detect(gone_buf)
+    eq(renderer.prune(gone_buf, left or {}), 1, "the translation of a removed comment is dropped")
+    eq(renderer.count(gone_buf), 1, "the surviving block keeps its translation")
+    local kept = {}
+    for _, m in ipairs(vim.api.nvim_buf_get_extmarks(gone_buf, renderer.ns, 0, -1, {})) do
+      kept[#kept + 1] = m[2]
+    end
+    deq(kept, { 0 }, "the remaining mark stays on its own row")
+  end
+  eq(renderer.clear(gone_buf), true, "clearing the pruned buffer")
+end
+
+---------------------------------------------------------------------------
 -- Markdown detection
 ----------------------------------------------------------------------------
 local md_lines = {
@@ -496,6 +587,129 @@ ok(write_done, "run keeps going through a plain :write")
 eq(require("trans.renderer").count(write_buf), 2, "results survive a plain :write")
 
 ----------------------------------------------------------------------------
+-- quick translation under the cursor (:TransHere)
+---------------------------------------------------------------------------
+local here = require("trans")
+
+trans.setup({
+  target = "ja",
+  max_concurrency = 1,
+  cache = { enabled = true, path = tmp_cache },
+  notify = true,
+})
+eq(vim.fn.exists(":TransHere"), 2, ":TransHere command defined")
+
+local here_nonce = tostring(math.random(1000000, 9999999))
+local here_buf = make_buf({
+  "// here one " .. here_nonce,
+  "int a;",
+  "// here two " .. here_nonce,
+  "int b;",
+  "// here three " .. here_nonce,
+}, "c")
+
+-- the rows that carry virtual lines, sorted, with their first line
+local function marked_blocks(buf)
+  local out = {}
+  for _, m in ipairs(vim.api.nvim_buf_get_extmarks(buf, ns, 0, -1, { details = true })) do
+    local virt = m[4].virt_lines or {}
+    out[#out + 1] = { row = m[2], text = virt[1] and virt[1][1][1] or "" }
+  end
+  table.sort(out, function(a, b)
+    return a.row < b.row
+  end)
+  return out
+end
+
+local function wait_idle(buf)
+  return vim.wait(30000, function()
+    return not trans.is_translating(buf)
+  end, 50)
+end
+
+-- the cursor decides which block is translated
+vim.api.nvim_set_current_buf(here_buf)
+vim.api.nvim_win_set_cursor(0, { 3, 0 })
+ok(pcall(vim.cmd, "TransHere"), ":TransHere runs with the cursor inside a comment")
+ok(wait_idle(here_buf), "quick translation finished")
+local shown = marked_blocks(here_buf)
+eq(#shown, 1, "only the block under the cursor is translated")
+eq(shown[1] and shown[1].row, 2, "the block keeps its own anchor row")
+
+-- running it again hides that block
+vim.cmd("TransHere")
+ok(wait_idle(here_buf), "toggle run finished")
+eq(#marked_blocks(here_buf), 0, ":TransHere hides its block again")
+
+-- a cursor on code translates nothing
+vim.api.nvim_win_set_cursor(0, { 2, 0 })
+vim.cmd("TransHere")
+ok(not trans.is_translating(here_buf), "no run is started for a code line")
+eq(#marked_blocks(here_buf), 0, "no virtual lines for a code line")
+
+-- independent blocks: one command each, the rest of the buffer untouched
+trans.translate_at(here_buf, 0)
+ok(wait_idle(here_buf), "first quick translation finished")
+trans.translate_at(here_buf, 4)
+ok(wait_idle(here_buf), "second quick translation finished")
+local independent = marked_blocks(here_buf)
+eq(#independent, 2, "two independent blocks are shown")
+deq({ independent[1].row, independent[2].row }, { 0, 4 }, "each block stays on its row")
+ok(not require("trans.auto").is_enabled(here_buf), "quick translations do not enable auto updates")
+
+-- a full run redraws every block, a quick run can still pull one out
+trans.translate(here_buf)
+ok(wait_idle(here_buf), "full run finished")
+eq(#marked_blocks(here_buf), 3, ":Trans shows every block")
+
+-- editing a block redraws it instead of stacking a second virtual line
+local before_edit = marked_blocks(here_buf)
+vim.api.nvim_buf_set_lines(here_buf, 2, 3, false, { "// here edited " .. here_nonce })
+trans.translate_at(here_buf, 2)
+ok(wait_idle(here_buf), "re-translation of the edited block finished")
+local after_edit = marked_blocks(here_buf)
+eq(#after_edit, #before_edit, "the edited block is redrawn, not duplicated")
+deq({ after_edit[1].row, after_edit[2].row, after_edit[3].row }, { 0, 2, 4 }, "rows stay in place")
+ok(after_edit[2].text ~= "" and after_edit[2].text ~= before_edit[2].text, "the old text is replaced")
+
+-- and back off again
+trans.translate_at(here_buf, 2)
+eq(#marked_blocks(here_buf), 2, ":TransHere hides the block it translated")
+
+trans.clear(here_buf)
+eq(#vim.api.nvim_buf_get_extmarks(here_buf, ns, 0, -1, {}), 0, ":TransClear removes quick translations too")
+
+-- Markdown works the same way, one paragraph per command
+local md_here = make_buf({
+  "# Heading " .. here_nonce,
+  "",
+  "A paragraph " .. here_nonce,
+  "wrapped over two lines.",
+  "",
+  "- one " .. here_nonce,
+  "- two " .. here_nonce,
+}, "markdown")
+vim.api.nvim_set_current_buf(md_here)
+vim.api.nvim_win_set_cursor(0, { 1, 0 })
+vim.cmd("TransHere")
+ok(wait_idle(md_here), "markdown quick translation finished")
+local md_shown = marked_blocks(md_here)
+eq(#md_shown, 1, "only the heading is translated")
+eq(md_shown[1] and md_shown[1].row, 0, "the heading keeps its anchor row")
+vim.cmd("TransHere")
+eq(#marked_blocks(md_here), 0, "the heading is hidden again")
+
+-- a paragraph is translated as a whole, not per wrapped line
+vim.api.nvim_win_set_cursor(0, { 4, 3 })
+trans.translate_at(md_here, 3)
+ok(wait_idle(md_here), "paragraph quick translation finished")
+local md_para = marked_blocks(md_here)
+eq(#md_para, 1, "one paragraph is one block")
+eq(md_para[1] and md_para[1].row, 3, "the paragraph is anchored on its last line")
+trans.clear(md_here)
+eq(#vim.api.nvim_buf_get_extmarks(md_here, ns, 0, -1, {}), 0, ":TransClear removes them too")
+
+---------------------------------------------------------------------------
 -- auto-update (debounced re-translation)
 ----------------------------------------------------------------------------
 local auto = require("trans.auto")

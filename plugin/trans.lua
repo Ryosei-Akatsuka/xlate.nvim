@@ -26,6 +26,12 @@ end, {
   desc = "Translate the buffer and show results as virtual lines",
 })
 
+vim.api.nvim_create_user_command("TransHere", function()
+  require("trans").translate_here()
+end, {
+  desc = "Translate the comment block under the cursor",
+})
+
 vim.api.nvim_create_user_command("TransClear", function()
   require("trans").clear()
 end, {
